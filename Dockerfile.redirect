@@ -1,0 +1,27 @@
+# Redirect Engine Dockerfile
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+COPY prisma.config.ts ./
+
+# Install dependencies
+RUN npm install
+
+# Generate Prisma client
+RUN npx prisma generate
+
+# Copy source files
+COPY src/ ./src/
+COPY redirect-engine/ ./redirect-engine/
+
+# Build the app
+RUN npm run build
+
+# Expose port
+EXPOSE 4000
+
+# Start redirect engine
+CMD ["npx", "tsx", "redirect-engine/server.ts"]
