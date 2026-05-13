@@ -1,0 +1,89 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum DomainStatus {
+  PENDING
+  VERIFIED
+  DISABLED
+}
+
+enum RouteStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum RouteMatchType {
+  EXACT
+  FALLBACK
+}
+
+model Domain {
+  id                String       @id @default(cuid())
+  hostname          String       @unique
+  status            DomainStatus @default(PENDING)
+  verificationToken String       @unique
+  dnsTxtName        String
+  dnsTxtValue       String
+  wildcardEnabled   Boolean      @default(false)
+  fallbackUrl       String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  routes Route[]
+  events RedirectEvent[]
+
+  @@index([status, hostname])
+}
+
+model Route {
+  id             String         @id @default(cuid())
+  domainId       String
+  subdomain      String?
+  path           String?
+  destinationUrl String
+  status         RouteStatus    @default(ACTIVE)
+  matchType      RouteMatchType @default(EXACT)
+  lookupKey      String
+  preservePath   Boolean        @default(false)
+  preserveQuery  Boolean        @default(true)
+  redirectType   Int            @default(302)
+  clickCount     Int            @default(0)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  domain Domain @relation(fields: [domainId], references: [id], onDelete: Cascade)
+  events RedirectEvent[]
+
+  @@unique([domainId, lookupKey])
+  @@index([domainId, subdomain, path, status])
+}
+
+model RedirectEvent {
+  id          String   @id @default(cuid())
+  domainId    String
+  routeId     String?
+  hostname    String
+  path        String
+  destination String?
+  statusCode  Int
+  referer     String?
+  userAgent   String?
+  ipHash      String?
+  device      String?
+  browser     String?
+  os          String?
+  country     String?
+  createdAt   DateTime @default(now())
+
+  domain Domain @relation(fields: [domainId], references: [id], onDelete: Cascade)
+  route  Route? @relation(fields: [routeId], references: [id], onDelete: SetNull)
+
+  @@index([domainId, createdAt])
+  @@index([routeId, createdAt])
+  @@index([country, createdAt])
+}
