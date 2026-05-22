@@ -64,9 +64,15 @@ async function findDomain(hostname: string) {
     orderBy: { hostname: "desc" },
   });
 
-  const matched = wildcardDomains.find((domain) =>
-    hostname.endsWith(`.${domain.hostname}`),
-  );
+  const matched = wildcardDomains.find((domain) => {
+    const hostLabels = hostname.split(".");
+    const rootLabels = domain.hostname.split(".");
+    if (hostLabels.length <= rootLabels.length) return false;
+    for (let i = 0; i < rootLabels.length; i++) {
+      if (hostLabels[hostLabels.length - 1 - i] !== rootLabels[rootLabels.length - 1 - i]) return false;
+    }
+    return true;
+  });
 
   if (matched) {
     log("info", "domain_matched", {

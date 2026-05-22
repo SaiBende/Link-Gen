@@ -56,12 +56,20 @@ export function getSubdomain(hostname: string, rootDomain: string) {
     return null;
   }
 
-  const suffix = `.${rootDomain}`;
-  if (!hostname.endsWith(suffix)) {
+  const hostLabels = hostname.split(".");
+  const rootLabels = rootDomain.split(".");
+
+  if (hostLabels.length <= rootLabels.length) {
     return null;
   }
 
-  return hostname.slice(0, -suffix.length);
+  for (let i = 0; i < rootLabels.length; i++) {
+    if (hostLabels[hostLabels.length - 1 - i] !== rootLabels[rootLabels.length - 1 - i]) {
+      return null;
+    }
+  }
+
+  return hostLabels.slice(0, hostLabels.length - rootLabels.length).join(".");
 }
 
 export function appendRequestParts(

@@ -49,7 +49,7 @@ async function lookupCountry(ip: string | null): Promise<string | null> {
   const apiKey = process.env.IPAPI_KEY;
   const url = apiKey
     ? `https://ipapi.co/${ip}/json/?key=${apiKey}`
-    : `http://ipapi.co/${ip}/json/`;
+    : `https://ipapi.co/${ip}/json/`;
 
   try {
     const response = await fetch(url, {

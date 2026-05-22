@@ -1,0 +1,48 @@
+{
+  "family": "redirect-platform-engine",
+  "taskRoleArn": null,
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "containerDefinitions": [
+    {
+      "name": "redirect-engine",
+      "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/redirect-platform/engine:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 4000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "REDIRECT_ENGINE_PORT", "value": "4000" },
+        { "name": "REDIRECT_DELAY_SECONDS", "value": "5" },
+        { "name": "REDIRECT_PAGE_TITLE", "value": "You are being redirected" },
+        { "name": "REDIRECT_PAGE_MESSAGE", "value": "Please wait while we take you to your destination." }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/DATABASE_URL" },
+        { "name": "REDIS_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/REDIS_URL" },
+        { "name": "DEFAULT_HOME_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/DEFAULT_HOME_URL" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/redirect-platform",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "engine"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:4000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3
+      }
+    }
+  ]
+}

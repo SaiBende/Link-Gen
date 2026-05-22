@@ -2,7 +2,6 @@
 
 import {
   Activity,
-  AlertTriangle,
   ArrowRight,
   CheckCircle2,
   Clock3,
@@ -17,9 +16,15 @@ import {
   RefreshCw,
   Route,
   Server,
+  WifiOff,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+
+const POLL_INTERVAL = 30_000;
+const TOAST_DURATION = 4000;
+
+let toastId = 0;
 
 function clientLog(level: "info" | "error" | "warn", message: string, meta?: Record<string, unknown>) {
   const timestamp = new Date().toISOString();
@@ -47,6 +52,14 @@ if (typeof window !== "undefined") {
   window.addEventListener("unhandledrejection", (event) => {
     clientLog("error", "unhandled_rejection", { reason: String(event.reason) });
   });
+}
+
+function Skeleton({ className }: { className?: string }) {
+  return <div className={`animate-pulse rounded-md bg-[#eaecf0] ${className ?? ""}`} />;
+}
+
+function StatCardSkeleton() {
+  return <div className="rounded-lg border border-[#dfe4ed] bg-white p-4"><Skeleton className="mb-2 h-3 w-20" /><Skeleton className="h-6 w-12" /></div>;
 }
 
 type DomainStatus = "PENDING" | "VERIFIED" | "DISABLED";
@@ -104,8 +117,9 @@ type Analytics = {
   }>;
 };
 
-type Notice = {
-  type: "success" | "error";
+type Toast = {
+  id: number;
+  type: "success" | "error" | "info";
   message: string;
   details?: string[];
 };
@@ -188,8 +202,14 @@ function formatRouteType(route: RedirectRoute) {
   return "root path";
 }
 
-function formatRedirectType(route: RedirectRoute) {
-  return route.redirectType === 301 ? "301" : "302";
+function formatTimeAgo(dateString: string) {
+  const diff = Date.now() - new Date(dateString).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
 }
 
 function statusClass(status: DomainStatus) {
@@ -204,96 +224,56 @@ function statusClass(status: DomainStatus) {
   return "bg-[#fff7e6] text-[#b54708]";
 }
 
-async function readJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { cache: "no-store" });
-
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
-  }
-
-  return response.json() as Promise<T>;
-}
-
-async function writeJson<T>(url: string, body: unknown): Promise<T> {
+async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
-    method: "POST",
+    cache: "no-store",
+    ...options,
     headers: {
       "Content-Type": "application/json",
+      ...options?.headers,
     },
-    body: JSON.stringify(body),
   });
 
   const contentType = response.headers.get("content-type") ?? "";
-  const payload = contentType.includes("application/json")
-    ? ((await response.json()) as T & ApiErrorPayload)
-    : ({ error: await response.text() } as T & ApiErrorPayload);
+  const json = contentType.includes("application/json")
+    ? await response.json()
+    : null;
 
   if (!response.ok) {
-    throw new ApiRequestError(
-      payload.error ?? `Request failed: ${response.status}`,
-      payload.expected,
-    );
+    const errMsg = json?.error ?? `Request failed: ${response.status}`;
+    throw new ApiRequestError(errMsg, json?.expected);
   }
 
-  return payload;
+  return json as T;
 }
 
-async function updateJson<T>(url: string, body: unknown): Promise<T> {
-  const response = await fetch(url, {
-    method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const contentType = response.headers.get("content-type") ?? "";
-  const payload = contentType.includes("application/json")
-    ? ((await response.json()) as T & ApiErrorPayload)
-    : ({ error: await response.text() } as T & ApiErrorPayload);
-
-  if (!response.ok) {
-    throw new ApiRequestError(
-      payload.error ?? `Request failed: ${response.status}`,
-      payload.expected,
-    );
-  }
-
-  return payload;
-}
-
-async function deleteJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { method: "DELETE" });
-  const contentType = response.headers.get("content-type") ?? "";
-  const payload = contentType.includes("application/json")
-    ? ((await response.json()) as T & ApiErrorPayload)
-    : ({ error: await response.text() } as T & ApiErrorPayload);
-
-  if (!response.ok) {
-    throw new ApiRequestError(
-      payload.error ?? `Request failed: ${response.status}`,
-      payload.expected,
-    );
-  }
-
-  return payload;
-}
+function apiGet<T>(url: string) { return apiFetch<T>(url); }
+function apiPost<T>(url: string, body?: unknown) { return apiFetch<T>(url, { method: "POST", body: body ? JSON.stringify(body) : undefined }); }
+function apiPatch<T>(url: string, body: unknown) { return apiFetch<T>(url, { method: "PATCH", body: JSON.stringify(body) }); }
+function apiDelete<T>(url: string) { return apiFetch<T>(url, { method: "DELETE" }); }
 
 export function DashboardClient() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [routes, setRoutes] = useState<RedirectRoute[]>([]);
   const [analytics, setAnalytics] = useState<Analytics>(emptyAnalytics);
   const [selectedDomainId, setSelectedDomainId] = useState("");
-  const [loading, setLoading] = useState(true);
   const [savingDomain, setSavingDomain] = useState(false);
   const [updatingDomain, setUpdatingDomain] = useState(false);
   const [savingRoute, setSavingRoute] = useState(false);
   const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
   const [updatingRouteId, setUpdatingRouteId] = useState<string | null>(null);
-  const [lastChangedRouteId, setLastChangedRouteId] = useState<string | null>(
-    null,
-  );
-  const [notice, setNotice] = useState<Notice | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [isOnline, setIsOnline] = useState(true);
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  function addToast(type: Toast["type"], message: string, details?: string[]) {
+    const id = ++toastId;
+    setToasts((prev) => [...prev, { id, type, message, details }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, TOAST_DURATION);
+  }
 
   const selectedDomain = useMemo(
     () => domains.find((domain) => domain.id === selectedDomainId) ?? null,
@@ -301,31 +281,28 @@ export function DashboardClient() {
   );
 
   const visibleRoutes = useMemo(() => {
-    if (!selectedDomainId) {
-      return routes;
-    }
-
+    if (!selectedDomainId) return routes;
     return routes.filter((route) => route.domainId === selectedDomainId);
   }, [routes, selectedDomainId]);
 
   const visibleEvents = useMemo(() => {
-    if (!selectedDomain) {
-      return analytics.recentEvents;
-    }
-
+    if (!selectedDomain) return analytics.recentEvents;
     return analytics.recentEvents.filter(
       (event) => event.domain.hostname === selectedDomain.hostname,
     );
   }, [analytics.recentEvents, selectedDomain]);
 
-  async function refresh() {
-    setLoading(true);
+  const totalRoutes = visibleRoutes.length;
+  const verifiedDomains = domains.filter(
+    (domain) => domain.status === "VERIFIED",
+  ).length;
 
+  const refresh = useCallback(async function () {
     try {
       const [domainPayload, routePayload, analyticsPayload] = await Promise.all([
-        readJson<{ domains: Domain[] }>("/api/domains"),
-        readJson<{ routes: RedirectRoute[] }>("/api/routes"),
-        readJson<Analytics>("/api/analytics"),
+        apiGet<{ domains: Domain[] }>("/api/domains"),
+        apiGet<{ routes: RedirectRoute[] }>("/api/routes"),
+        apiGet<Analytics>("/api/analytics"),
       ]);
 
       setDomains(domainPayload.domains);
@@ -337,29 +314,41 @@ export function DashboardClient() {
           ? current
           : "",
       );
+
+      setIsOnline(true);
     } catch (error) {
-      setNotice({
-        type: "error",
-        message:
-          error instanceof Error
-            ? error.message
-            : "Unable to load dashboard data.",
-      });
+      setIsOnline(false);
+      if (loading) {
+        addToast(
+          "error",
+          error instanceof Error ? error.message : "Unable to load dashboard data.",
+        );
+      }
     } finally {
       setLoading(false);
     }
-  }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    // This client console fetches its first dashboard snapshot after hydration.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void refresh();
+    startTransition(() => {
+      void refresh();
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    pollingRef.current = setInterval(() => void refresh(), POLL_INTERVAL);
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const isLoading = loading && domains.length === 0;
 
   async function createDomain(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSavingDomain(true);
-    setNotice(null);
 
     const form = new FormData(event.currentTarget);
     const hostname = String(form.get("hostname") ?? "");
@@ -367,24 +356,21 @@ export function DashboardClient() {
     const wildcardEnabled = form.get("wildcardEnabled") === "on";
 
     try {
-      await writeJson("/api/domains", {
+      const { domain } = await apiPost<{ domain: Domain }>("/api/domains", {
         hostname,
         fallbackUrl,
         wildcardEnabled,
       });
 
       event.currentTarget.reset();
-      setNotice({ type: "success", message: "Domain created." });
-      const domainPayload = await readJson<{ domains: Domain[] }>("/api/domains");
-      setDomains(domainPayload.domains);
-      setSelectedDomainId(domainPayload.domains[0]?.id ?? "");
-      await refresh();
+      setDomains((prev) => [domain, ...prev]);
+      setSelectedDomainId(domain.id);
+      addToast("success", `Domain ${domain.hostname} created.`);
     } catch (error) {
-      setNotice({
-        type: "error",
-        message:
-          error instanceof Error ? error.message : "Unable to create domain.",
-      });
+      addToast(
+        "error",
+        error instanceof Error ? error.message : "Unable to create domain.",
+      );
     } finally {
       setSavingDomain(false);
     }
@@ -393,98 +379,93 @@ export function DashboardClient() {
   async function createRoute(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSavingRoute(true);
-    setNotice(null);
 
     const form = new FormData(event.currentTarget);
-    const matchType = String(form.get("matchType") ?? "EXACT") as RouteMatchType;
-    const redirectType = form.get("redirectType") === "301" ? 301 : 302;
 
     try {
-      await writeJson("/api/routes", {
+      const { route } = await apiPost<{ route: RedirectRoute }>("/api/routes", {
         domainId: String(form.get("domainId") ?? ""),
         subdomain: String(form.get("subdomain") ?? ""),
         path: String(form.get("path") ?? ""),
         destinationUrl: String(form.get("destinationUrl") ?? ""),
-        matchType,
+        matchType: String(form.get("matchType") ?? "EXACT"),
         preservePath: form.get("preservePath") === "on",
         preserveQuery: form.get("preserveQuery") === "on",
-        redirectType,
+        redirectType: form.get("redirectType") === "301" ? 301 : 302,
       });
 
       event.currentTarget.reset();
-      setNotice({ type: "success", message: "Route created." });
-      await refresh();
+      setRoutes((prev) => [route, ...prev]);
+      addToast("success", "Route created.");
     } catch (error) {
-      setNotice({
-        type: "error",
-        message:
-          error instanceof Error ? error.message : "Unable to create route.",
-      });
+      addToast(
+        "error",
+        error instanceof Error ? error.message : "Unable to create route.",
+      );
     } finally {
       setSavingRoute(false);
     }
   }
 
   async function verifyDomain(domainId: string) {
-    setNotice(null);
-
     try {
-      await writeJson(`/api/domains/${domainId}/verify`, {});
-      setNotice({ type: "success", message: "Domain verified." });
-      await refresh();
-    } catch (error) {
-      const expected =
-        error instanceof ApiRequestError && error.expected
-          ? [
-              `Type: ${error.expected.type}`,
-              `Name: ${error.expected.name}`,
-              `Value: ${error.expected.value}`,
-            ]
-          : undefined;
+      const result = await apiPost<{ verified: boolean; domain: Domain }>(
+        `/api/domains/${domainId}/verify`,
+        {},
+      );
 
-      setNotice({
-        type: "error",
-        message:
-          error instanceof Error
-            ? error.message
-            : "DNS verification record was not found.",
-        details: expected,
-      });
+      setDomains((prev) =>
+        prev.map((d) => (d.id === domainId ? result.domain : d)),
+      );
+      addToast("success", "Domain verified!");
+    } catch (error) {
+      const err = error instanceof ApiRequestError ? error : null;
+      addToast(
+        "error",
+        err?.message ?? "DNS verification record was not found.",
+        err?.expected
+          ? [
+              `Type: ${err.expected.type}`,
+              `Name: ${err.expected.name}`,
+              `Value: ${err.expected.value}`,
+            ]
+          : undefined,
+      );
     }
   }
 
   async function copyText(value: string) {
     await navigator.clipboard.writeText(value);
-    setNotice({ type: "success", message: "Copied to clipboard." });
+    addToast("info", "Copied to clipboard.");
   }
 
   async function updateDomain(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
-    if (!selectedDomain) {
-      return;
-    }
+    if (!selectedDomain) return;
 
     setUpdatingDomain(true);
-    setNotice(null);
 
     const form = new FormData(event.currentTarget);
 
     try {
-      await updateJson(`/api/domains/${selectedDomain.id}`, {
-        fallbackUrl: String(form.get("fallbackUrl") ?? ""),
-        wildcardEnabled: form.get("wildcardEnabled") === "on",
-        status: String(form.get("status") ?? selectedDomain.status) as DomainStatus,
-      });
+      const { domain } = await apiPatch<{ domain: Domain }>(
+        `/api/domains/${selectedDomain.id}`,
+        {
+          fallbackUrl: String(form.get("fallbackUrl") ?? ""),
+          wildcardEnabled: form.get("wildcardEnabled") === "on",
+          status: String(form.get("status") ?? selectedDomain.status),
+        },
+      );
 
-      setNotice({ type: "success", message: "Domain settings saved." });
-      await refresh();
+      setDomains((prev) =>
+        prev.map((d) => (d.id === selectedDomain.id ? domain : d)),
+      );
+      addToast("success", "Domain settings saved.");
     } catch (error) {
-      setNotice({
-        type: "error",
-        message:
-          error instanceof Error ? error.message : "Unable to update domain.",
-      });
+      addToast(
+        "error",
+        error instanceof Error ? error.message : "Unable to update domain.",
+      );
     } finally {
       setUpdatingDomain(false);
     }
@@ -505,20 +486,21 @@ export function DashboardClient() {
     successMessage: string,
   ) {
     setUpdatingRouteId(routeId);
-    setNotice(null);
 
     try {
-      await updateJson(`/api/routes/${routeId}`, body);
-      setNotice({ type: "success", message: successMessage });
-      setLastChangedRouteId(routeId);
+      const { route } = await apiPatch<{ route: RedirectRoute }>(
+        `/api/routes/${routeId}`,
+        body,
+      );
+
+      setRoutes((prev) => prev.map((r) => (r.id === routeId ? route : r)));
       setEditingRouteId(null);
-      await refresh();
+      addToast("success", successMessage);
     } catch (error) {
-      setNotice({
-        type: "error",
-        message:
-          error instanceof Error ? error.message : "Unable to update route.",
-      });
+      addToast(
+        "error",
+        error instanceof Error ? error.message : "Unable to update route.",
+      );
     } finally {
       setUpdatingRouteId(null);
     }
@@ -527,7 +509,6 @@ export function DashboardClient() {
   async function saveRoute(event: FormEvent<HTMLFormElement>, routeId: string) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const redirectType = form.get("redirectType") === "301" ? 301 : 302;
 
     await updateRoute(
       routeId,
@@ -539,163 +520,138 @@ export function DashboardClient() {
         status: String(form.get("status") ?? "ACTIVE") as "ACTIVE" | "DISABLED",
         preservePath: form.get("preservePath") === "on",
         preserveQuery: form.get("preserveQuery") === "on",
-        redirectType,
+        redirectType: form.get("redirectType") === "301" ? 301 : 302,
       },
       "Route updated.",
     );
   }
 
   async function deleteRoute(route: RedirectRoute) {
-    const confirmed = window.confirm(`Delete ${formatSource(route)}?`);
-
-    if (!confirmed) {
-      return;
-    }
+    if (!window.confirm(`Delete ${formatSource(route)}?`)) return;
 
     setUpdatingRouteId(route.id);
-    setNotice(null);
+
+    setRoutes((prev) => prev.filter((r) => r.id !== route.id));
 
     try {
-      await deleteJson(`/api/routes/${route.id}`);
-      setNotice({ type: "success", message: "Route deleted." });
-      setLastChangedRouteId(null);
-      await refresh();
+      await apiDelete(`/api/routes/${route.id}`);
+      addToast("success", "Route deleted.");
     } catch (error) {
-      setNotice({
-        type: "error",
-        message:
-          error instanceof Error ? error.message : "Unable to delete route.",
-      });
+      setRoutes((prev) => [...prev, route]);
+      addToast(
+        "error",
+        error instanceof Error ? error.message : "Unable to delete route.",
+      );
     } finally {
       setUpdatingRouteId(null);
     }
   }
 
-  const totalRoutes = visibleRoutes.length;
-  const verifiedDomains = domains.filter(
-    (domain) => domain.status === "VERIFIED",
-  ).length;
-
   return (
     <main className="min-h-screen bg-[#f7f8fb] text-[#12151f]">
-      {notice ? (
+      {toasts.map((toast) => (
         <div
-          className={`fixed right-5 top-5 z-50 flex max-w-sm items-center justify-between gap-4 rounded-lg border px-4 py-3 text-sm shadow-lg ${
-            notice.type === "success"
+          key={toast.id}
+          className={`fixed right-5 z-50 flex max-w-sm animate-in items-start justify-between gap-4 rounded-lg border px-4 py-3 text-sm shadow-lg slide-in-from-top-2 fade-in ${
+            toast.type === "success"
               ? "border-[#abefc6] bg-white text-[#027a48]"
-              : "border-[#fecdca] bg-white text-[#b42318]"
+              : toast.type === "error"
+                ? "border-[#fecdca] bg-white text-[#b42318]"
+                : "border-[#dfe4ed] bg-white text-[#344054]"
           }`}
+          style={{ top: `${20 + toasts.indexOf(toast) * 72}px` }}
         >
-          <div>
-            <p>{notice.message}</p>
-            {notice.details ? (
+          <div className="min-w-0">
+            <p>{toast.message}</p>
+            {toast.details ? (
               <div className="mt-2 space-y-1 font-mono text-xs text-[#475467]">
-                {notice.details.map((detail) => (
+                {toast.details.map((detail) => (
                   <p key={detail}>{detail}</p>
                 ))}
               </div>
             ) : null}
           </div>
           <button
-            className="rounded-md p-1 text-[#667085] hover:bg-[#f2f4f7]"
+            className="shrink-0 rounded-md p-1 text-[#667085] hover:bg-[#f2f4f7]"
             type="button"
-            onClick={() => setNotice(null)}
-            aria-label="Dismiss notification"
+            onClick={() => setToasts((prev) => prev.filter((t) => t.id !== toast.id))}
+            aria-label="Dismiss"
           >
             <X className="size-4" />
           </button>
         </div>
-      ) : null}
+      ))}
+
       <div className="border-b border-[#dfe4ed] bg-white">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4">
-          <div className="flex items-center gap-3">
-            <div className="flex size-9 items-center justify-center rounded-lg bg-[#111827] text-white">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-5 py-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-[#111827] text-white">
               <Network className="size-4" />
             </div>
-            <div>
-              <p className="text-sm font-semibold leading-5">Redirect Platform</p>
+            <div className="min-w-0">
+              <p className="text-sm font-semibold leading-5 truncate">Redirect Platform</p>
               <p className="text-xs text-[#667085]">Domain routing console</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
+            {!isOnline && (
+              <span className="flex items-center gap-1.5 rounded-md bg-[#fef3f2] px-2 py-1 text-xs font-medium text-[#b42318]">
+                <WifiOff className="size-3" />
+                Offline
+              </span>
+            )}
             <Button
               variant="outline"
               size="sm"
               onClick={() => void refresh()}
-              disabled={loading}
+              disabled={isLoading}
             >
-              <RefreshCw className="size-4" />
-              Refresh
+              <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
+              Auto
             </Button>
             <Button variant="outline" size="sm">
               <Server className="size-4" />
-              Edge port 4000
+              <span className="hidden sm:inline">Edge port 4000</span>
             </Button>
           </div>
         </div>
       </div>
 
-      <div className="mx-auto grid max-w-7xl gap-5 px-5 py-6 lg:grid-cols-[280px_1fr]">
-        <aside className="space-y-3">
-          {[
-            ["Domains", Globe2],
-            ["Routes", Route],
-            ["Analytics", Activity],
-            ["DNS verification", CheckCircle2],
-          ].map(([label, Icon]) => (
-            <a
-              className="flex h-10 w-full items-center gap-3 rounded-md px-3 text-left text-sm font-medium text-[#344054] hover:bg-white"
-              href={`#${String(label).toLowerCase().replace(" ", "-")}`}
-              key={label as string}
-            >
-              <Icon className="size-4 text-[#667085]" />
-              {label as string}
-            </a>
-          ))}
-        </aside>
-
+      <div className="mx-auto max-w-7xl px-5 py-6">
         <section className="space-y-5">
-          {notice ? (
-            <div
-              className={`rounded-md border px-4 py-3 text-sm ${
-                notice.type === "success"
-                  ? "border-[#abefc6] bg-[#ecfdf3] text-[#027a48]"
-                  : "border-[#fecdca] bg-[#fef3f2] text-[#b42318]"
-              }`}
-            >
-              <p>{notice.message}</p>
-              {notice.details ? (
-                <div className="mt-2 space-y-1 font-mono text-xs">
-                  {notice.details.map((detail) => (
-                    <p key={detail}>{detail}</p>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-
-          <div className="grid gap-4 md:grid-cols-4">
-            {[
-              ["Connected domains", String(domains.length), Globe2],
-              ["Verified domains", String(verifiedDomains), CheckCircle2],
-              ["Active routes", String(totalRoutes), Route],
-              ["Total redirects", String(analytics.totalRedirects), Activity],
-            ].map(([label, value, Icon]) => (
-              <div
-                className="rounded-lg border border-[#dfe4ed] bg-white p-4"
-                key={label as string}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="text-xs font-medium text-[#667085]">
-                    {label as string}
-                  </p>
-                  <Icon className="size-4 text-[#667085]" />
-                </div>
-                <p className="mt-3 text-2xl font-semibold tracking-normal">
-                  {loading ? "..." : (value as string)}
-                </p>
-              </div>
-            ))}
+          <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
+            {isLoading ? (
+              <>
+                <StatCardSkeleton />
+                <StatCardSkeleton />
+                <StatCardSkeleton />
+                <StatCardSkeleton />
+              </>
+            ) : (
+              <>
+                {[
+                  ["Connected domains", String(domains.length), Globe2],
+                  ["Verified domains", String(verifiedDomains), CheckCircle2],
+                  ["Active routes", String(totalRoutes), Route],
+                  ["Total redirects", String(analytics.totalRedirects), Activity],
+                ].map(([label, value, Icon]) => (
+                  <div
+                    className="rounded-lg border border-[#dfe4ed] bg-white p-4"
+                    key={label as string}
+                  >
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs font-medium text-[#667085]">
+                        {label as string}
+                      </p>
+                      <Icon className="size-4 text-[#667085] shrink-0" />
+                    </div>
+                    <p className="mt-3 text-2xl font-semibold tracking-normal">
+                      {value as string}
+                    </p>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
 
           <div className="grid gap-5 xl:grid-cols-[1fr_380px]">
@@ -705,52 +661,66 @@ export function DashboardClient() {
             >
               <div className="flex items-center justify-between border-b border-[#eaecf0] px-4 py-3">
                 <h1 className="text-sm font-semibold">Domains</h1>
-                <Button
-                  variant={selectedDomainId ? "outline" : "secondary"}
-                  size="xs"
-                  type="button"
-                  onClick={() => setSelectedDomainId("")}
-                >
-                  All domains
-                </Button>
+                {selectedDomainId && (
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    type="button"
+                    onClick={() => setSelectedDomainId("")}
+                  >
+                    All domains
+                  </Button>
+                )}
               </div>
               <div className="divide-y divide-[#eaecf0]">
-                {domains.map((domain) => (
-                  <button
-                    className={`grid w-full gap-3 px-4 py-4 text-left md:grid-cols-[1.2fr_120px_100px_110px] ${
-                      selectedDomain?.id === domain.id ? "bg-[#f9fafb]" : ""
-                    }`}
-                    key={domain.hostname}
-                    onClick={() => setSelectedDomainId(domain.id)}
-                  >
-                    <div>
-                      <p className="font-medium">{domain.hostname}</p>
-                      <p className="text-xs text-[#667085]">
-                        wildcard {domain.wildcardEnabled ? "enabled" : "disabled"}
-                      </p>
-                    </div>
-                    <div>
-                      <span
-                        className={`rounded-md px-2 py-1 text-xs font-medium ${statusClass(
-                          domain.status,
-                        )}`}
-                      >
-                        {domain.status.toLowerCase()}
-                      </span>
-                    </div>
-                    <div className="text-sm text-[#344054]">
-                      {domain._count.routes} routes
-                    </div>
-                    <div className="text-sm font-medium">
-                      {domain._count.events} hits
-                    </div>
-                  </button>
-                ))}
-                {domains.length === 0 ? (
-                  <div className="px-4 py-8 text-sm text-[#667085]">
-                    No domains yet.
+                {isLoading ? (
+                  <>
+                    {[1, 2, 3].map((i) => (
+                      <div key={i} className="px-4 py-4">
+                        <Skeleton className="mb-1 h-4 w-40" />
+                        <Skeleton className="h-3 w-24" />
+                      </div>
+                    ))}
+                  </>
+                ) : domains.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center px-4 py-12 text-sm text-[#667085]">
+                    <Globe2 className="mb-2 size-8 text-[#d0d5dd]" />
+                    <p>No domains yet.</p>
+                    <p className="text-xs mt-1">Add your first domain using the form.</p>
                   </div>
-                ) : null}
+                ) : (
+                  domains.map((domain) => (
+                    <button
+                      className={`grid w-full gap-2 px-4 py-4 text-left sm:grid-cols-[1.2fr_120px_100px_110px] ${
+                        selectedDomain?.id === domain.id ? "bg-[#f9fafb]" : "hover:bg-[#fafafa]"
+                      } transition-colors`}
+                      key={domain.hostname}
+                      onClick={() => setSelectedDomainId(domain.id)}
+                    >
+                      <div className="min-w-0">
+                        <p className="font-medium truncate">{domain.hostname}</p>
+                        <p className="text-xs text-[#667085]">
+                          wildcard {domain.wildcardEnabled ? "enabled" : "disabled"}
+                        </p>
+                      </div>
+                      <div>
+                        <span
+                          className={`inline-block rounded-md px-2 py-1 text-xs font-medium ${statusClass(
+                            domain.status,
+                          )}`}
+                        >
+                          {domain.status.toLowerCase()}
+                        </span>
+                      </div>
+                      <div className="text-sm text-[#344054]">
+                        {domain._count.routes} routes
+                      </div>
+                      <div className="text-sm font-medium">
+                        {domain._count.events} hits
+                      </div>
+                    </button>
+                  ))
+                )}
               </div>
             </div>
 
@@ -763,7 +733,7 @@ export function DashboardClient() {
                 <label className="block text-xs font-medium text-[#344054]">
                   Hostname
                   <input
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none transition-colors focus:border-[#111827] focus:ring-1 focus:ring-[#111827]/20"
                     name="hostname"
                     placeholder="domain.com"
                     required
@@ -772,7 +742,7 @@ export function DashboardClient() {
                 <label className="block text-xs font-medium text-[#344054]">
                   Fallback URL
                   <input
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none transition-colors focus:border-[#111827] focus:ring-1 focus:ring-[#111827]/20"
                     name="fallbackUrl"
                     placeholder="https://example.com"
                     type="url"
@@ -796,24 +766,20 @@ export function DashboardClient() {
           </div>
 
           <div className="grid gap-5 xl:grid-cols-[1fr_380px]">
-            <form
-              key={selectedDomain?.id ?? "no-domain"}
-              className="rounded-lg border border-[#dfe4ed] bg-white p-4"
-              onSubmit={updateDomain}
-            >
+            <div className="rounded-lg border border-[#dfe4ed] bg-white p-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold">Domain Settings</h2>
                 <span className="text-xs text-[#667085]">
-                  {selectedDomain ? selectedDomain.hostname : "All domains"}
+                  {selectedDomain ? selectedDomain.hostname : "No domain selected"}
                 </span>
               </div>
 
               {selectedDomain ? (
-                <div className="mt-4 space-y-3">
+                <form className="mt-4 space-y-3" onSubmit={updateDomain}>
                   <label className="block text-xs font-medium text-[#344054]">
                     Fallback URL
                     <input
-                      className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none focus:border-[#111827]"
+                      className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none transition-colors focus:border-[#111827] focus:ring-1 focus:ring-[#111827]/20"
                       name="fallbackUrl"
                       defaultValue={selectedDomain.fallbackUrl ?? ""}
                       placeholder="https://example.com"
@@ -823,7 +789,7 @@ export function DashboardClient() {
                   <label className="block text-xs font-medium text-[#344054]">
                     Status
                     <select
-                      className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none focus:border-[#111827]"
+                      className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none transition-colors focus:border-[#111827]"
                       name="status"
                       defaultValue={selectedDomain.status}
                     >
@@ -845,28 +811,46 @@ export function DashboardClient() {
                     <Save className="size-4" />
                     {updatingDomain ? "Saving..." : "Save domain"}
                   </Button>
-                </div>
+                </form>
               ) : (
-                <div className="mt-4 text-sm text-[#667085]">
-                  Select a domain to edit fallback, wildcard, and status.
+                <div className="mt-4 flex flex-col items-center justify-center py-8 text-sm text-[#667085]">
+                  <Globe2 className="mb-2 size-8 text-[#d0d5dd]" />
+                  Select a domain to edit settings.
                 </div>
               )}
-            </form>
+            </div>
 
             <div className="rounded-lg border border-[#dfe4ed] bg-white p-4">
               <h2 className="text-sm font-semibold">Local Test Commands</h2>
-              <div className="mt-4 space-y-3 text-sm">
-                <div className="rounded-md bg-[#111827] p-3 font-mono text-xs text-white">
-                  curl -I -H &quot;Host: example.test&quot;
-                  http://localhost:4000/github
+              <div className="mt-4 space-y-3">
+                <div className="relative group">
+                  <pre className="overflow-x-auto rounded-md bg-[#111827] p-3 font-mono text-xs text-white">
+                    curl -I -H &quot;Host: example.test&quot; http://localhost:4000/github
+                  </pre>
+                  <button
+                    className="absolute right-2 top-2 rounded p-1 text-[#9ca3af] opacity-0 transition-opacity hover:text-white group-hover:opacity-100"
+                    type="button"
+                    onClick={() => void copyText('curl -I -H "Host: example.test" http://localhost:4000/github')}
+                    aria-label="Copy command"
+                  >
+                    <Copy className="size-3.5" />
+                  </button>
                 </div>
-                <div className="rounded-md bg-[#111827] p-3 font-mono text-xs text-white">
-                  curl -I -H &quot;Host: blog.example.test&quot;
-                  http://localhost:4000/
+                <div className="relative group">
+                  <pre className="overflow-x-auto rounded-md bg-[#111827] p-3 font-mono text-xs text-white">
+                    curl -I -H &quot;Host: blog.example.test&quot; http://localhost:4000/
+                  </pre>
+                  <button
+                    className="absolute right-2 top-2 rounded p-1 text-[#9ca3af] opacity-0 transition-opacity hover:text-white group-hover:opacity-100"
+                    type="button"
+                    onClick={() => void copyText('curl -I -H "Host: blog.example.test" http://localhost:4000/')}
+                    aria-label="Copy command"
+                  >
+                    <Copy className="size-3.5" />
+                  </button>
                 </div>
                 <p className="text-xs text-[#667085]">
-                  Start the redirect engine with npm run dev:redirect before
-                  testing redirects.
+                  Start the redirect engine with npm run dev:redirect before testing.
                 </p>
               </div>
             </div>
@@ -883,23 +867,27 @@ export function DashboardClient() {
                 <label className="block text-xs font-medium text-[#344054]">
                   Domain
                   <select
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none transition-colors focus:border-[#111827]"
                     name="domainId"
                     required
                     value={selectedDomain?.id ?? domains[0]?.id ?? ""}
                     onChange={(event) => setSelectedDomainId(event.target.value)}
                   >
-                    {domains.map((domain) => (
-                      <option key={domain.id} value={domain.id}>
-                        {domain.hostname}
-                      </option>
-                    ))}
+                    {domains.length === 0 ? (
+                      <option value="">No domains available</option>
+                    ) : (
+                      domains.map((domain) => (
+                        <option key={domain.id} value={domain.id}>
+                          {domain.hostname}
+                        </option>
+                      ))
+                    )}
                   </select>
                 </label>
                 <label className="block text-xs font-medium text-[#344054]">
                   Match type
                   <select
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none transition-colors focus:border-[#111827]"
                     name="matchType"
                     defaultValue="EXACT"
                   >
@@ -910,7 +898,7 @@ export function DashboardClient() {
                 <label className="block text-xs font-medium text-[#344054]">
                   Redirect type
                   <select
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-3 text-sm outline-none transition-colors focus:border-[#111827]"
                     name="redirectType"
                     defaultValue="302"
                   >
@@ -921,7 +909,7 @@ export function DashboardClient() {
                 <label className="block text-xs font-medium text-[#344054]">
                   Subdomain
                   <input
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none transition-colors focus:border-[#111827] focus:ring-1 focus:ring-[#111827]/20"
                     name="subdomain"
                     placeholder="blog, docs, * for wildcard"
                   />
@@ -929,7 +917,7 @@ export function DashboardClient() {
                 <label className="block text-xs font-medium text-[#344054]">
                   Path
                   <input
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none transition-colors focus:border-[#111827] focus:ring-1 focus:ring-[#111827]/20"
                     name="path"
                     placeholder="/github"
                   />
@@ -937,7 +925,7 @@ export function DashboardClient() {
                 <label className="block text-xs font-medium text-[#344054]">
                   Destination URL
                   <input
-                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none focus:border-[#111827]"
+                    className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-3 text-sm outline-none transition-colors focus:border-[#111827] focus:ring-1 focus:ring-[#111827]/20"
                     name="destinationUrl"
                     placeholder="https://github.com/acme"
                     required
@@ -946,12 +934,12 @@ export function DashboardClient() {
                 </label>
                 <div className="grid gap-2 sm:grid-cols-2">
                   <label className="flex items-center gap-2 text-xs font-medium text-[#344054]">
-                    <input className="size-4" name="preservePath" type="checkbox" />
+                    <input className="size-4 rounded border-[#d0d5dd]" name="preservePath" type="checkbox" />
                     Preserve path
                   </label>
                   <label className="flex items-center gap-2 text-xs font-medium text-[#344054]">
                     <input
-                      className="size-4"
+                      className="size-4 rounded border-[#d0d5dd]"
                       name="preserveQuery"
                       type="checkbox"
                       defaultChecked
@@ -962,7 +950,7 @@ export function DashboardClient() {
               </div>
               <Button
                 className="mt-4 w-full"
-                disabled={savingRoute || !domains[0]}
+                disabled={savingRoute || domains.length === 0}
                 type="submit"
               >
                 <Plus className="size-4" />
@@ -971,205 +959,210 @@ export function DashboardClient() {
             </form>
 
             <div className="rounded-lg border border-[#dfe4ed] bg-white">
-              <div className="border-b border-[#eaecf0] px-4 py-3">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-sm font-semibold">Routes</h2>
-                  <span className="text-xs text-[#667085]">
-                    {selectedDomain ? selectedDomain.hostname : "All domains"}
-                  </span>
-                </div>
+              <div className="flex items-center justify-between border-b border-[#eaecf0] px-4 py-3">
+                <h2 className="text-sm font-semibold">Routes</h2>
+                <span className="text-xs text-[#667085]">
+                  {selectedDomain ? selectedDomain.hostname : `${routes.length} total`}
+                </span>
               </div>
               <div className="divide-y divide-[#eaecf0]">
-                {visibleRoutes.map((route) =>
-                  editingRouteId === route.id ? (
-                    <form
-                      className="grid gap-3 px-4 py-4"
-                      key={route.id}
-                      onSubmit={(event) => void saveRoute(event, route.id)}
-                    >
-                      <div className="grid gap-3 md:grid-cols-[90px_80px_1fr_1fr_1.5fr_90px]">
-                        <label className="block text-xs font-medium text-[#344054]">
-                          Type
-                          <select
-                            className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-2 text-sm"
-                            name="matchType"
-                            defaultValue={route.matchType}
-                          >
-                            <option value="EXACT">Exact</option>
-                            <option value="FALLBACK">Fallback</option>
-                          </select>
-                        </label>
-                        <label className="block text-xs font-medium text-[#344054]">
-                          Redirect
-                          <select
-                            className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-2 text-sm"
-                            name="redirectType"
-                            defaultValue={String(route.redirectType)}
-                          >
-                            <option value="302">302</option>
-                            <option value="301">301</option>
-                          </select>
-                        </label>
-                        <label className="block text-xs font-medium text-[#344054]">
-                          Subdomain
-                          <input
-                            className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-2 text-sm"
-                            name="subdomain"
-                            defaultValue={route.subdomain ?? ""}
-                            placeholder="blog"
-                          />
-                        </label>
-                        <label className="block text-xs font-medium text-[#344054]">
-                          Path
-                          <input
-                            className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-2 text-sm"
-                            name="path"
-                            defaultValue={route.path ?? ""}
-                            placeholder="/github"
-                          />
-                        </label>
-                        <label className="block text-xs font-medium text-[#344054]">
-                          Destination
-                          <input
-                            className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] px-2 text-sm"
-                            name="destinationUrl"
-                            defaultValue={route.destinationUrl}
-                            required
-                            type="url"
-                          />
-                        </label>
-                        <label className="block text-xs font-medium text-[#344054]">
-                          Status
-                          <select
-                            className="mt-1 h-9 w-full rounded-md border border-[#d0d5dd] bg-white px-2 text-sm"
-                            name="status"
-                            defaultValue={route.status}
-                          >
-                            <option value="ACTIVE">Active</option>
-                            <option value="DISABLED">Disabled</option>
-                          </select>
-                        </label>
-                      </div>
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="flex flex-wrap gap-4">
-                          <label className="flex items-center gap-2 text-xs font-medium text-[#344054]">
-                            <input
-                              className="size-4"
-                              name="preservePath"
-                              type="checkbox"
-                              defaultChecked={route.preservePath}
-                            />
-                            Preserve path
-                          </label>
-                          <label className="flex items-center gap-2 text-xs font-medium text-[#344054]">
-                            <input
-                              className="size-4"
-                              name="preserveQuery"
-                              type="checkbox"
-                              defaultChecked={route.preserveQuery}
-                            />
-                            Preserve query
-                          </label>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            type="button"
-                            onClick={() => setEditingRouteId(null)}
-                          >
-                            <X className="size-4" />
-                            Cancel
-                          </Button>
-                          <Button
-                            size="sm"
-                            disabled={updatingRouteId === route.id}
-                            type="submit"
-                          >
-                            <Save className="size-4" />
-                            Save
-                          </Button>
+                {isLoading ? (
+                  <>
+                    {[1, 2, 3].map((i) => (
+                      <div key={i} className="px-4 py-4">
+                        <div className="flex items-center gap-3">
+                          <Skeleton className="h-4 w-48" />
+                          <Skeleton className="h-4 w-32" />
                         </div>
                       </div>
-                    </form>
-                  ) : (
-                    <div
-                      className="grid gap-3 px-4 py-4 md:grid-cols-[1fr_auto_1.2fr_130px_90px_150px]"
-                      key={route.id}
-                    >
-                      <a
-                        className="min-w-0 truncate font-medium text-[#175cd3] hover:underline"
-                        href={getLocalTestUrl(route)}
-                        target="_blank"
-                        rel="noreferrer"
-                        title="Open through local redirect engine"
-                      >
-                        {formatSource(route)}
-                      </a>
-                      <ArrowRight className="hidden size-4 text-[#98a2b3] md:block" />
-                      <p className="min-w-0 truncate text-sm text-[#344054]">
-                        {route.destinationUrl}
-                      </p>
-                      <p className="text-xs font-medium uppercase tracking-normal text-[#667085]">
-                        {formatRouteType(route)}
-                      </p>
-                      <p className="text-sm font-medium">
-                        {route.clickCount} hits
-                      </p>
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant={route.status === "ACTIVE" ? "outline" : "secondary"}
-                          size="xs"
-                          type="button"
-                          disabled={updatingRouteId === route.id}
-                          onClick={() =>
-                            void updateRoute(
-                              route.id,
-                              {
-                                status:
-                                  route.status === "ACTIVE"
-                                    ? "DISABLED"
-                                    : "ACTIVE",
-                              },
-                              route.status === "ACTIVE"
-                                ? "Route disabled."
-                                : "Route enabled.",
-                            )
-                          }
-                        >
-                          {route.status === "ACTIVE" ? "Disable" : "Enable"}
-                        </Button>
-                        {lastChangedRouteId === route.id ? (
-                          <span className="hidden text-xs font-medium text-[#027a48] xl:inline">
-                            Saved
-                          </span>
-                        ) : null}
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          type="button"
-                          onClick={() => setEditingRouteId(route.id)}
-                        >
-                          <Pencil className="size-4" />
-                        </Button>
-                        <Button
-                          variant="destructive"
-                          size="icon-sm"
-                          type="button"
-                          disabled={updatingRouteId === route.id}
-                          onClick={() => void deleteRoute(route)}
-                        >
-                          <Trash2 className="size-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  ),
-                )}
-                {visibleRoutes.length === 0 ? (
-                  <div className="px-4 py-8 text-sm text-[#667085]">
-                    No routes yet.
+                    ))}
+                  </>
+                ) : visibleRoutes.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center px-4 py-12 text-sm text-[#667085]">
+                    <Route className="mb-2 size-8 text-[#d0d5dd]" />
+                    <p>No routes yet.</p>
+                    <p className="text-xs mt-1">Create a route using the form.</p>
                   </div>
-                ) : null}
+                ) : (
+                  visibleRoutes.map((route) =>
+                    editingRouteId === route.id ? (
+                      <form
+                        className="px-4 py-4 space-y-3"
+                        key={route.id}
+                        onSubmit={(event) => void saveRoute(event, route.id)}
+                      >
+                        <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+                          <label className="block text-xs font-medium text-[#344054]">
+                            Type
+                            <select
+                              className="mt-1 h-8 w-full rounded-md border border-[#d0d5dd] bg-white px-2 text-sm"
+                              name="matchType"
+                              defaultValue={route.matchType}
+                            >
+                              <option value="EXACT">Exact</option>
+                              <option value="FALLBACK">Fallback</option>
+                            </select>
+                          </label>
+                          <label className="block text-xs font-medium text-[#344054]">
+                            Redirect
+                            <select
+                              className="mt-1 h-8 w-full rounded-md border border-[#d0d5dd] bg-white px-2 text-sm"
+                              name="redirectType"
+                              defaultValue={String(route.redirectType)}
+                            >
+                              <option value="302">302</option>
+                              <option value="301">301</option>
+                            </select>
+                          </label>
+                          <label className="block text-xs font-medium text-[#344054]">
+                            Subdomain
+                            <input
+                              className="mt-1 h-8 w-full rounded-md border border-[#d0d5dd] px-2 text-sm"
+                              name="subdomain"
+                              defaultValue={route.subdomain ?? ""}
+                            />
+                          </label>
+                          <label className="block text-xs font-medium text-[#344054]">
+                            Path
+                            <input
+                              className="mt-1 h-8 w-full rounded-md border border-[#d0d5dd] px-2 text-sm"
+                              name="path"
+                              defaultValue={route.path ?? ""}
+                            />
+                          </label>
+                          <label className="block text-xs font-medium text-[#344054]">
+                            Destination
+                            <input
+                              className="mt-1 h-8 w-full rounded-md border border-[#d0d5dd] px-2 text-sm"
+                              name="destinationUrl"
+                              defaultValue={route.destinationUrl}
+                              required
+                              type="url"
+                            />
+                          </label>
+                          <label className="block text-xs font-medium text-[#344054]">
+                            Status
+                            <select
+                              className="mt-1 h-8 w-full rounded-md border border-[#d0d5dd] bg-white px-2 text-sm"
+                              name="status"
+                              defaultValue={route.status}
+                            >
+                              <option value="ACTIVE">Active</option>
+                              <option value="DISABLED">Disabled</option>
+                            </select>
+                          </label>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="flex flex-wrap gap-4">
+                            <label className="flex items-center gap-2 text-xs font-medium text-[#344054]">
+                              <input
+                                className="size-4 rounded border-[#d0d5dd]"
+                                name="preservePath"
+                                type="checkbox"
+                                defaultChecked={route.preservePath}
+                              />
+                              Preserve path
+                            </label>
+                            <label className="flex items-center gap-2 text-xs font-medium text-[#344054]">
+                              <input
+                                className="size-4 rounded border-[#d0d5dd]"
+                                name="preserveQuery"
+                                type="checkbox"
+                                defaultChecked={route.preserveQuery}
+                              />
+                              Preserve query
+                            </label>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              type="button"
+                              onClick={() => setEditingRouteId(null)}
+                            >
+                              <X className="size-4" />
+                              Cancel
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={updatingRouteId === route.id}
+                              type="submit"
+                            >
+                              <Save className="size-4" />
+                              Save
+                            </Button>
+                          </div>
+                        </div>
+                      </form>
+                    ) : (
+                      <div
+                        className="grid gap-2 px-4 py-4 sm:grid-cols-[1fr_auto_1.2fr_100px_70px_auto] items-center"
+                        key={route.id}
+                      >
+                        <a
+                          className="min-w-0 truncate font-medium text-[#175cd3] hover:underline"
+                          href={getLocalTestUrl(route)}
+                          target="_blank"
+                          rel="noreferrer"
+                          title="Open through local redirect engine"
+                        >
+                          {formatSource(route)}
+                        </a>
+                        <ArrowRight className="hidden size-4 text-[#98a2b3] sm:block shrink-0" />
+                        <p className="min-w-0 truncate text-sm text-[#344054]">
+                          {route.destinationUrl}
+                        </p>
+                        <p className="text-xs font-medium uppercase tracking-normal text-[#667085]">
+                          {formatRouteType(route)}
+                        </p>
+                        <p className="text-sm font-medium">
+                          {route.clickCount} hits
+                        </p>
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant={route.status === "ACTIVE" ? "outline" : "secondary"}
+                            size="xs"
+                            type="button"
+                            disabled={updatingRouteId === route.id}
+                            onClick={() =>
+                              void updateRoute(
+                                route.id,
+                                {
+                                  status:
+                                    route.status === "ACTIVE"
+                                      ? "DISABLED"
+                                      : "ACTIVE",
+                                },
+                                route.status === "ACTIVE"
+                                  ? "Route disabled."
+                                  : "Route enabled.",
+                              )
+                            }
+                          >
+                            {route.status === "ACTIVE" ? "Disable" : "Enable"}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            type="button"
+                            onClick={() => setEditingRouteId(route.id)}
+                          >
+                            <Pencil className="size-4" />
+                          </Button>
+                          <Button
+                            variant="destructive"
+                            size="icon-sm"
+                            type="button"
+                            disabled={updatingRouteId === route.id}
+                            onClick={() => void deleteRoute(route)}
+                          >
+                            <Trash2 className="size-4" />
+                          </Button>
+                        </div>
+                      </div>
+                    ),
+                  )
+                )}
               </div>
             </div>
           </div>
@@ -1179,33 +1172,54 @@ export function DashboardClient() {
               className="rounded-lg border border-[#dfe4ed] bg-white"
               id="analytics"
             >
-              <div className="border-b border-[#eaecf0] px-4 py-3">
+              <div className="flex items-center justify-between border-b border-[#eaecf0] px-4 py-3">
                 <h2 className="text-sm font-semibold">Recent Redirects</h2>
+                <span className="text-xs text-[#667085]">
+                  {analytics.recentEvents.length} events
+                </span>
               </div>
               <div className="divide-y divide-[#eaecf0]">
-                {visibleEvents.map((event) => (
-                  <div
-                    className="grid gap-3 px-4 py-4 md:grid-cols-[1fr_80px_1fr_150px]"
-                    key={event.id}
-                  >
-                    <p className="min-w-0 truncate font-medium">
-                      {event.hostname}
-                      {event.path}
-                    </p>
-                    <p className="text-sm font-medium">{event.statusCode}</p>
-                    <p className="min-w-0 truncate text-sm text-[#344054]">
-                      {event.destination ?? "not found"}
-                    </p>
-                    <p className="text-xs text-[#667085]">
-                      {new Date(event.createdAt).toLocaleString()}
-                    </p>
+                {isLoading ? (
+                  <>
+                    {[1, 2, 3].map((i) => (
+                      <div key={i} className="px-4 py-4">
+                        <Skeleton className="h-4 w-64" />
+                      </div>
+                    ))}
+                  </>
+                ) : visibleEvents.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center px-4 py-12 text-sm text-[#667085]">
+                    <Activity className="mb-2 size-8 text-[#d0d5dd]" />
+                    <p>No redirect events yet.</p>
+                    <p className="text-xs mt-1">Events appear after the redirect engine handles a request.</p>
                   </div>
-                ))}
-                {visibleEvents.length === 0 ? (
-                  <div className="px-4 py-8 text-sm text-[#667085]">
-                    No redirect events yet.
-                  </div>
-                ) : null}
+                ) : (
+                  visibleEvents.map((event) => (
+                    <div
+                      className="grid gap-2 px-4 py-4 sm:grid-cols-[1fr_60px_1fr_100px] items-center"
+                      key={event.id}
+                    >
+                      <p className="min-w-0 truncate font-medium text-sm">
+                        {event.hostname}{event.path}
+                      </p>
+                      <span
+                        className={`inline-block w-fit rounded px-1.5 py-0.5 text-xs font-medium ${
+                          event.statusCode === 404
+                            ? "bg-[#fef3f2] text-[#b42318]"
+                            : "bg-[#ecfdf3] text-[#027a48]"
+                        }`}
+                      >
+                        {event.statusCode}
+                      </span>
+                      <p className="min-w-0 truncate text-sm text-[#344054]">
+                        {event.destination ?? "not found"}
+                      </p>
+                      <p className="text-xs text-[#667085] text-right sm:text-left">
+                        {formatTimeAgo(event.createdAt)}
+                      </p>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
 
@@ -1222,7 +1236,7 @@ export function DashboardClient() {
                 <div className="mt-4 space-y-3">
                   <div>
                     <p className="text-xs text-[#667085]">Selected domain</p>
-                    <p className="font-medium">{selectedDomain.hostname}</p>
+                    <p className="font-medium truncate">{selectedDomain.hostname}</p>
                   </div>
                   <div className="rounded-md bg-[#f2f4f7] p-3">
                     <div className="flex items-center justify-between gap-3">
@@ -1246,7 +1260,7 @@ export function DashboardClient() {
                     <div className="flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <p className="text-xs text-[#667085]">TXT value</p>
-                        <p className="truncate text-sm font-medium">
+                        <p className="truncate text-sm font-medium break-all">
                           {selectedDomain.dnsTxtValue}
                         </p>
                       </div>
@@ -1269,11 +1283,12 @@ export function DashboardClient() {
                     onClick={() => void verifyDomain(selectedDomain.id)}
                   >
                     <CheckCircle2 className="size-4" />
-                    Check DNS
+                    {selectedDomain.status === "VERIFIED" ? "Re-verify DNS" : "Check DNS"}
                   </Button>
                 </div>
               ) : (
-                <div className="mt-4 text-sm text-[#667085]">
+                <div className="mt-4 flex flex-col items-center justify-center py-8 text-sm text-[#667085]">
+                  <Globe2 className="mb-2 size-8 text-[#d0d5dd]" />
                   Select or create a domain.
                 </div>
               )}

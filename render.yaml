@@ -2,7 +2,7 @@ services:
   - type: web
     name: redirect-engine
     env: node
-    buildCommand: npm install && npx prisma generate && npm run build
+    buildCommand: npm install && npx prisma generate
     startCommand: npx tsx redirect-engine/server.ts
     envVars:
       - key: NODE_ENV
@@ -12,8 +12,12 @@ services:
       - key: REDIRECT_DELAY_SECONDS
         value: "5"
       - key: DEFAULT_HOME_URL
-        value: https://YOUR-VERCEL-APP.vercel.app
+        value: "https://YOUR-VERCEL-DASHBOARD.vercel.app"
       - key: REDIRECT_PAGE_TITLE
         value: "You are being redirected"
       - key: REDIRECT_PAGE_MESSAGE
         value: "Please wait while we take you to your destination."
+      - key: DATABASE_URL
+        value: "postgresql://..."
+      - key: REDIS_URL
+        value: "redis://..."

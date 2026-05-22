@@ -1,0 +1,67 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_DASHBOARD: redirect-platform/dashboard
+  ECR_REPOSITORY_ENGINE: redirect-platform/engine
+  ECS_CLUSTER: redirect-platform
+  ECS_SERVICE_DASHBOARD: redirect-platform-dashboard
+  ECS_SERVICE_ENGINE: redirect-platform-engine
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push dashboard
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_DASHBOARD }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_DASHBOARD }}:${{ github.sha }}
+
+      - name: Build and push redirect engine
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.redirect
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_ENGINE }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_ENGINE }}:${{ github.sha }}
+
+      - name: Deploy dashboard to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_DASHBOARD }} \
+            --force-new-deployment
+
+      - name: Deploy redirect engine to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_ENGINE }} \
+            --force-new-deployment

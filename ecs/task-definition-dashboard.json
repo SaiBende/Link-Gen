@@ -1,0 +1,44 @@
+{
+  "family": "redirect-platform-dashboard",
+  "taskRoleArn": null,
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "containerDefinitions": [
+    {
+      "name": "dashboard",
+      "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/redirect-platform/dashboard:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 3000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "PORT", "value": "3000" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/DATABASE_URL" },
+        { "name": "REDIS_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/REDIS_URL" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/redirect-platform",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "dashboard"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:3000/api/error || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3
+      }
+    }
+  ]
+}

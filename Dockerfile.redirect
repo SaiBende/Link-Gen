@@ -5,20 +5,18 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+COPY prisma/ ./prisma/
 COPY prisma.config.ts ./
 
-# Install dependencies
+# Install all dependencies (tsx is needed at runtime)
 RUN npm install
 
 # Generate Prisma client
 RUN npx prisma generate
 
-# Copy source files
-COPY src/ ./src/
+# Copy source files (only what the redirect engine needs)
+COPY src/lib/ ./src/lib/
 COPY redirect-engine/ ./redirect-engine/
-
-# Build the app
-RUN npm run build
 
 # Expose port
 EXPOSE 4000
