@@ -133,37 +133,43 @@ routes:<domainId>:<hostname>
 ### Architecture (Production)
 
 ```
-GitHub Push → GitHub Actions → Build & Push to ECR → ECS Fargate
-                                                          │
-                    ┌─────────────────────────────────────┼────────────────────┐
-                    │              AWS VPC                │                    │
-                    │                                     │                    │
-                    │  ┌──────────────────────────────┐   │                    │
-                    │  │     ECS Cluster (Fargate)     │   │                    │
-                    │  │                               │   │                    │
-                    │  │  ┌──────────┐ ┌────────────┐  │   │                    │
-                    │  │  │ Dashboard│ │   Engine   │  │   │                    │
-                    │  │  │ :3000    │ │ :4000      │  │   │                    │
-                    │  │  └────┬─────┘ └─────┬──────┘  │   │                    │
-                    │  └───────┼──────────────┼─────────┘   │                    │
-                    │          │              │             │                    │
-                    │  ┌───────┴──────────────┴─────────┐   │                    │
-                    │  │        AWS Private Network      │   │                    │
-                    │  └───────┬──────────────┬─────────┘   │                    │
-                    │          │              │             │                    │
-                    │  ┌───────▼────┐  ┌──────▼──────┐     │                    │
-                    │  │ RDS        │  │ ElastiCache  │     │                    │
-                    │  │ PostgreSQL │  │ Redis        │     │                    │
-                    │  └────────────┘  └──────────────┘     │                    │
-                    └───────────────────────────────────────┘
+                          Internet
+                             │
+                  ┌──────────┴──────────┐
+                  │   Elastic IP (DNS)  │
+                  │   (or ALB DNS)      │
+                  └──────────┬──────────┘
+                             │
+                  ┌──────────▼──────────┐
+                  │   EC2 Instance      │
+                  │   (t3.micro)        │
+                  │                     │
+                  │  ┌──────────────┐   │
+                  │  │  Docker      │   │
+                  │  │              │   │
+                  │  │ ┌──────────┐ │   │
+                  │  │ │ Dashboard│ │   │
+                  │  │ │ :3000    │ │   │
+                  │  │ ├──────────┤ │   │
+                  │  │ │ Engine   │ │   │
+                  │  │ │ :4000    │ │   │
+                  │  │ └──────────┘ │   │
+                  │  └──────────────┘   │
+                  └──────────┬──────────┘
+                             │
+                  ┌──────────┴──────────┐
+                  │   AWS Private Net   │
+                  ├─────────────────────┤
+                  │  RDS (PostgreSQL)   │
+                  │  Valkey (Redis)     │
+                  └─────────────────────┘
 ```
 
-- All 4 containers run on **ECS Fargate** (no EC2 to manage)
-- RDS + ElastiCache are managed services (click, done)
-- GitHub push → auto-build → auto-deploy via GitHub Actions
-- Secrets stored in **AWS SSM Parameter Store** (not hardcoded)
+- EC2 runs Docker → both apps in containers
+- RDS + Valkey are managed (already running)
+- Elastic IP gives you a stable public IP for DNS
 
-### Local — Everything in Containers (same as ECS)
+### Local — Everything in Containers (same as production)
 
 ```bash
 docker compose up --build
@@ -172,97 +178,118 @@ docker compose exec dashboard npx prisma migrate deploy
 
 Dashboard at `http://localhost:3000`, engine at `http://localhost:4000`.
 
-### ECS Setup Guide
+### Production Setup — EC2 + Docker
 
-#### Step 1: Create AWS Resources (via Console, ~20 min)
+#### Prerequisites (already done)
+- ✅ RDS PostgreSQL running
+- ✅ Valkey (Redis) running
+- ✅ ECR repos created (optional — you can pull from GitHub directly)
 
-**a) ECR repositories (store Docker images):**
-```
-redirect-platform/dashboard
-redirect-platform/engine
-```
+#### Step 1: Launch EC2 Instance
 
-**b) RDS PostgreSQL:**
-- Engine: PostgreSQL 16
-- DB instance class: `db.t3.micro` (free tier)
-- Public access: No (same VPC as ECS)
+AWS Console → **EC2** → **Instances** → **Launch instance**:
 
-**c) ElastiCache Redis:**
-- Cluster mode: Disabled
-- Node type: `cache.t3.micro`
-- Same VPC as ECS
-
-**d) SSM Parameters (for secrets):**
-| Parameter Name | Value |
+| Setting | Value |
 |---|---|
-| `/redirect-platform/DATABASE_URL` | `postgresql://user:pass@rds-endpoint:5432/redirect_platform` |
-| `/redirect-platform/REDIS_URL` | `redis://redis-endpoint:6379` |
-| `/redirect-platform/DEFAULT_HOME_URL` | `http://dashboard-alb-xxxx.us-east-1.elb.amazonaws.com` |
+| Name | `redirect-platform-server` |
+| AMI | **Ubuntu 22.04 LTS** (free tier) |
+| Instance type | **t3.micro** (free tier) |
+| Key pair | Create or select an existing one (you'll need the `.pem` file to SSH) |
+| Network | **vpc-017fde30e67398c83** (same as RDS + Valkey) |
+| Subnet | Choose any public subnet |
+| Auto-assign public IP | **Enable** |
+| Security group | Create new: **`ec2-sg`** |
+| Security group rules | Add: **SSH (22)** from your IP, **HTTP (80)** from `0.0.0.0/0` |
+| Storage | **20 GB gp2** (free tier) |
 
-**e) ECS Cluster:**
-- Name: `redirect-platform`
-- Infrastructure: Fargate (serverless, no EC2)
+Click **Launch instance**. Wait ~1 min for status to show **Running**.
 
-**f) Application Load Balancer:**
-- Create one ALB for both services
-- Target group 1 (dashboard): port 3000, health check `/api/error`
-- Target group 2 (engine): port 4000, health check `/health`
+#### Step 2: Allocate Elastic IP
 
-#### Step 2: Register Task Definitions
+AWS Console → **EC2** → **Elastic IPs** → **Allocate Elastic IP address** → **Allocate**.
+
+Then select it → **Actions** → **Associate Elastic IP address**:
+- Resource type: **Instance**
+- Instance: select `redirect-platform-server`
+- **Associate**
+
+This gives you a **fixed public IP** that won't change.
+
+#### Step 3: SSH into EC2 & Install Docker
 
 ```bash
-# Replace YOUR_ACCOUNT_ID in the JSON files
-aws ecs register-task-definition --cli-input-json file://ecs/task-definition-dashboard.json
-aws ecs register-task-definition --cli-input-json file://ecs/task-definition-engine.json
+# From your local terminal (replace path and IP)
+ssh -i your-key.pem ubuntu@<elastic-ip>
+
+# Install Docker
+sudo apt update
+sudo apt install -y docker.io docker-compose-v2
+
+# Add ubuntu user to docker group (no sudo needed)
+sudo usermod -aG docker ubuntu
+
+# Log out and back in for group to take effect
+exit
+ssh -i your-key.pem ubuntu@<elastic-ip>
 ```
 
-#### Step 3: Create ECS Services
-
-Via AWS Console → ECS → `redirect-platform` cluster → Create service:
-
-| Setting | Dashboard | Engine |
-|---|---|---|
-| Task Definition | `redirect-platform-dashboard` | `redirect-platform-engine` |
-| Service Name | `redirect-platform-dashboard` | `redirect-platform-engine` |
-| Desired Tasks | 1 | 1 |
-| Load Balancer | ALB → target group port 3000 | ALB → target group port 4000 |
-| Security Group | Allow port 3000 from ALB | Allow port 4000 from ALB |
-
-#### Step 4: Deploy
+#### Step 4: Clone & Run
 
 ```bash
-# Push image to ECR (one-time, or let GitHub Actions handle it)
-docker build -t <account>.dkr.ecr.us-east-1.amazonaws.com/redirect-platform/dashboard:latest -f Dockerfile .
-docker push <account>.dkr.ecr.us-east-1.amazonaws.com/redirect-platform/dashboard:latest
+git clone https://github.com/SaiBende/Link-Gen.git
+cd Link-Gen
 
-# Run migrations
-aws ecs run-task --cluster redirect-platform --task-definition redirect-platform-dashboard --overrides '{"containerOverrides": [{"name": "dashboard", "command": ["npx", "prisma", "migrate", "deploy"]}]}'
+# Create .env file with your AWS endpoints
+cat > .env << 'EOF'
+DATABASE_URL=postgresql://redirect:redirect@redirect-platform-db.cdmuay6amro4.ap-south-1.rds.amazonaws.com:5432/postgres
+REDIS_URL=rediss://redirect-platform-cache-bhapxu.serverless.aps1.cache.amazonaws.com:6379
+DEFAULT_HOME_URL=http://<elastic-ip>
+REDIRECT_ENGINE_PORT=4000
+REDIRECT_DELAY_SECONDS=5
+EOF
+
+# Start all containers
+docker compose up --build -d
+
+# Run database migrations
+docker compose exec dashboard npx prisma migrate deploy
 ```
 
-#### Step 5: Git Push → Auto-deploy
+#### Step 5: Access
 
-The file `.github/workflows/deploy-ecs.yml` handles:
-1. Build Docker images
-2. Push to ECR
-3. Force new ECS deployment
+Open `http://<elastic-ip>` in your browser — dashboard loads.
 
-Configure these GitHub secrets:
+Check engine health: `http://<elastic-ip>:4000/health`
 
-| Secret | Value |
-|---|---|
-| `AWS_ROLE_ARN` | IAM role ARN for GitHub Actions OIDC (or use access keys) |
+#### Auto-deploy on Git Push
 
-### Required Environment Variables (SSM Parameters)
+On the EC2 instance, set up a simple auto-deploy:
 
-Stored in AWS SSM Parameter Store as secure strings:
-
-```
-/redirect-platform/DATABASE_URL
-/redirect-platform/REDIS_URL
-/redirect-platform/DEFAULT_HOME_URL
+```bash
+# Install the GitHub CLI or just use this cron approach:
+crontab -e
 ```
 
-Referenced in task definitions via `secrets` array — never hardcoded.
+Add this line:
+```
+*/5 * * * * cd /home/ubuntu/Link-Gen && git pull --ff-only && docker compose up --build -d 2>&1 | logger
+```
+
+This pulls and redeploys every 5 minutes. For instant deploy, use a GitHub webhook + a simple listener, or just SSH in and run `git pull && docker compose up --build -d` manually after each push.
+
+### Required Environment Variables
+
+Set these in the `.env` file on the EC2 or in `docker-compose.yml`:
+
+```
+DATABASE_URL=postgresql://redirect:redirect@<rds-endpoint>:5432/postgres
+REDIS_URL=rediss://<valkey-endpoint>:6379
+DEFAULT_HOME_URL=http://<elastic-ip>
+REDIRECT_ENGINE_PORT=4000
+REDIRECT_DELAY_SECONDS=5
+REDIRECT_PAGE_TITLE=You are being redirected
+REDIRECT_PAGE_MESSAGE=Please wait while we take you to your destination.
+```
 
 ## Domain DNS Setup
 
