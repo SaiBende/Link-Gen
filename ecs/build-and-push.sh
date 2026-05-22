@@ -2,7 +2,7 @@
 set -e
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-ap-south-1}"
 REPO_PREFIX="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/redirect-platform"
 
 # Login to ECR

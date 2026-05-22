@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "redirect-engine",
-      "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/redirect-platform/engine:latest",
+      "image": "381492164476.dkr.ecr.ap-south-1.amazonaws.com/redirect-platform/engine:latest",
       "essential": true,
       "portMappings": [
         {
@@ -25,15 +25,15 @@
         { "name": "REDIRECT_PAGE_MESSAGE", "value": "Please wait while we take you to your destination." }
       ],
       "secrets": [
-        { "name": "DATABASE_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/DATABASE_URL" },
-        { "name": "REDIS_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/REDIS_URL" },
-        { "name": "DEFAULT_HOME_URL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/redirect-platform/DEFAULT_HOME_URL" }
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:ssm:ap-south-1:381492164476:parameter/redirect-platform/DATABASE_URL" },
+        { "name": "REDIS_URL", "valueFrom": "arn:aws:ssm:ap-south-1:381492164476:parameter/redirect-platform/REDIS_URL" },
+        { "name": "DEFAULT_HOME_URL", "valueFrom": "arn:aws:ssm:ap-south-1:381492164476:parameter/redirect-platform/DEFAULT_HOME_URL" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/redirect-platform",
-          "awslogs-region": "us-east-1",
+          "awslogs-region": "ap-south-1",
           "awslogs-stream-prefix": "engine"
         }
       },
